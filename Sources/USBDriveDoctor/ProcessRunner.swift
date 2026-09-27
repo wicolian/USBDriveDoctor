@@ -12,7 +12,13 @@ enum ProcessRunner {
 
     /// Runs a command, collecting output incrementally (never blocks waiting
     /// for EOF), and kills it after `timeout` seconds if it hasn't finished.
-    static func run(_ launchPath: String, _ args: [String], timeout: TimeInterval, completion: @escaping (Output) -> Void) {
+    ///
+    /// Returns the underlying `Process` (or nil if it failed to launch) so a
+    /// caller can hold onto it and call `.terminate()` early - e.g. to honor
+    /// a user's "stop retrying" request while a mount attempt is in flight,
+    /// rather than waiting out the full timeout.
+    @discardableResult
+    static func run(_ launchPath: String, _ args: [String], timeout: TimeInterval, completion: @escaping (Output) -> Void) -> Process? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = args
@@ -62,9 +68,11 @@ enum ProcessRunner {
         do {
             try process.run()
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutItem)
+            return process
         } catch {
             finished = true
             completion(Output(text: "", timedOut: false, terminationStatus: -1))
+            return nil
         }
     }
 }

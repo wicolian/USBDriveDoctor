@@ -169,6 +169,14 @@ struct ContentView: View {
     }
 }
 
+private extension Text {
+    /// Small trailing-aligned note under a mount action - failure detail,
+    /// timeout explanation, etc.
+    func terminalNote(_ color: Color) -> some View {
+        self.font(.vitalMeta).foregroundStyle(color)
+    }
+}
+
 private struct LogLineView: View {
     let entry: LogEntry
 
@@ -297,40 +305,82 @@ private struct PartitionRow: View {
         .animation(.spring(response: 0.3, dampingFraction: 1.0), value: state)
     }
 
+    private var progress: MountProgress? { model.mountProgress[partition.id] }
+
     @ViewBuilder
     private var actionArea: some View {
         switch state {
-        case .idle, .failed, .timedOut, .disconnected:
+        case .idle:
+            if partition.mounted {
+                mountedLabel
+            } else {
+                Button("Try mount") { model.tryMount(partition) }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.accent)
+                    .controlSize(.small)
+            }
+
+        case .failed, .timedOut, .disconnected:
+            // Auto-retry normally carries these straight into .retryWaiting -
+            // this branch only shows once the user has stopped retrying, so
+            // it needs to offer a manual way back in.
             VStack(alignment: .trailing, spacing: 3) {
-                if partition.mounted {
-                    mountedLabel
-                } else {
-                    Button("Try mount") { model.tryMount(partition) }
-                        .buttonStyle(.borderedProminent)
-                        .tint(Theme.accent)
-                        .controlSize(.small)
-                }
+                Button("Try mount") { model.tryMount(partition) }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.accent)
+                    .controlSize(.small)
                 if case .timedOut = state {
-                    Text("Timed out - drive may be unstable")
-                        .font(.vitalMeta).foregroundStyle(Theme.advisory)
-                }
-                if case .disconnected = state {
-                    Text("Disconnected mid-attempt")
-                        .font(.vitalMeta).foregroundStyle(Theme.critical)
-                }
-                if case .failed(let msg) = state {
-                    Text(msg).font(.vitalMeta).foregroundStyle(Theme.critical)
-                        .lineLimit(2).frame(maxWidth: 200, alignment: .trailing)
+                    Text("Timed out - drive may be unstable").terminalNote(Theme.advisory)
+                } else if case .disconnected = state {
+                    Text("Disconnected mid-attempt").terminalNote(Theme.critical)
+                } else if case .failed(let msg) = state {
+                    Text(msg).terminalNote(Theme.critical).lineLimit(2).frame(maxWidth: 200, alignment: .trailing)
                 }
             }
-        case .trying(let secondsLeft):
-            HStack(spacing: Theme.Space.xs) {
-                ProgressView().controlSize(.small)
-                Text("\(secondsLeft)s").font(.vitalData).foregroundStyle(Theme.textSecondary)
+
+        case .trying:
+            VStack(alignment: .trailing, spacing: 3) {
+                HStack(spacing: Theme.Space.xs) {
+                    ProgressView().controlSize(.small)
+                    Text(elapsedLabel).font(.vitalData).foregroundStyle(Theme.textSecondary)
+                    if let mbps = progress?.throughputMBps {
+                        Text(String(format: "~%.0f MB/s", mbps))
+                            .font(.vitalData).foregroundStyle(Theme.signalHealthy)
+                    }
+                }
+                if let progress, progress.attempt > 1 {
+                    Text("Attempt \(progress.attempt)").font(.vitalMeta).foregroundStyle(Theme.textTertiary)
+                }
+                Text(progress?.phase ?? "Starting mount attempt…")
+                    .font(.vitalMeta).foregroundStyle(Theme.textTertiary)
+                    .lineLimit(2).frame(maxWidth: 210, alignment: .trailing)
+                stopRetryingButton
             }
+
+        case .retryWaiting(let resumesIn):
+            VStack(alignment: .trailing, spacing: 3) {
+                Text("Retrying in \(resumesIn)s…").font(.vitalData).foregroundStyle(Theme.advisory)
+                if let progress, progress.attempt > 1 {
+                    Text("Attempt \(progress.attempt) didn't stick").font(.vitalMeta).foregroundStyle(Theme.textTertiary)
+                }
+                stopRetryingButton
+            }
+
         case .success:
             mountedLabel
         }
+    }
+
+    private var elapsedLabel: String {
+        let s = progress?.secondsElapsed ?? 0
+        return s < 60 ? "\(s)s" : String(format: "%d:%02d", s / 60, s % 60)
+    }
+
+    private var stopRetryingButton: some View {
+        Button("Stop retrying") { model.stopRetrying(partition.id) }
+            .buttonStyle(.plain)
+            .font(.vitalMeta)
+            .foregroundStyle(Theme.textTertiary)
     }
 
     private var mountedLabel: some View {

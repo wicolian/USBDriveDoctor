@@ -55,11 +55,47 @@ struct DiskDevice: Identifiable, Equatable {
 
 enum MountAttemptState: Equatable {
     case idle
-    case trying(secondsLeft: Int)
+    /// Live detail (attempt number, elapsed time, throughput, phase text)
+    /// lives in `MountProgress`, keyed separately in `AppModel` - this case
+    /// just marks "an attempt is in flight."
+    case trying
+    /// Auto-retry is paused between attempts, counting down to the next one.
+    case retryWaiting(resumesIn: Int)
     case success
     case timedOut
     case disconnected
     case failed(String)
+}
+
+/// Real, honest signal about an in-flight mount attempt. No fabricated
+/// percentage or ETA - `diskutil mount` doesn't expose one, and guessing
+/// one would be exactly the kind of false hope this app exists to avoid.
+/// Elapsed time and live read throughput (from `iostat`) are the only two
+/// numbers we can actually know, so those are what's shown.
+struct MountProgress: Equatable {
+    var attempt: Int = 1
+    var secondsElapsed: Int = 0
+    var throughputMBps: Double?
+    var phase: String = "Starting mount attempt…"
+
+    /// Once a drive is actually transferring data, the overwhelmingly likely
+    /// reason a read-only exFAT/NTFS mount is still running is that it's
+    /// walking every folder's directory entries across the whole volume -
+    /// this is real, not a guess (verified by hand tonight with `iostat`
+    /// against Koushik's actual drive: steady throughput, ~39 minutes, for
+    /// 1.8TB of files). Only speak to that once there's actually a nonzero
+    /// read rate to point to.
+    static let indexingPhase = "Reading directory tables… large or struggling drives can take a long time here."
+}
+
+extension String {
+    /// "disk4s2" -> "disk4". Whole-disk `iostat` needs the disk name without
+    /// its partition suffix.
+    var wholeDiskName: String {
+        guard let sRange = range(of: "s", options: .backwards) else { return self }
+        let suffix = self[sRange.upperBound...]
+        return suffix.allSatisfy(\.isNumber) && !suffix.isEmpty ? String(self[..<sRange.lowerBound]) : self
+    }
 }
 
 struct LogEntry: Identifiable {

@@ -9,13 +9,37 @@ final class AppModel: ObservableObject {
     @Published var logEntries: [LogEntry] = []
     @Published var isStreaming = false
     @Published var mountStates: [String: MountAttemptState] = [:]
+    @Published var mountProgress: [String: MountProgress] = [:]
+    /// Whether "keep trying automatically" is currently active for a given
+    /// partition. On by default the moment a mount is requested - Koushik's
+    /// words were "auto try and mount regardless what" - and stays on across
+    /// retries until either it succeeds or the user explicitly stops it.
+    @Published var autoRetryEnabled: [String: Bool] = [:]
     @Published private(set) var overallStatus: OverallStatus = .quiet
 
-    private var mountTimers: [String: Timer] = [:]
+    private var mountTickers: [String: Timer] = [:]      // 1s elapsed/watchdog ticker per partition
+    private var retryWaitTimers: [String: Timer] = [:]   // backoff countdown between attempts
+    private var throughputMonitors: [String: LineStreamer] = [:]
+    /// Bumped every time a fresh attempt starts for a partition. A completion
+    /// handler checks its captured generation before applying anything, so a
+    /// stale result from an attempt that's already been superseded by a
+    /// retry (or cancelled) can't clobber newer state.
+    private var mountGeneration: [String: Int] = [:]
+    private var activeMountProcesses: [String: Process] = [:]
+    private var retryCounts: [String: Int] = [:]
+
     private var refreshTimer: Timer?
     private var statusTimer: Timer?
     private var lastWarningAt: Date?
     private let streamer = LineStreamer()
+
+    /// Escalating pause between auto-retry attempts: a drive that just
+    /// disconnected benefits from a few seconds' rest, not an instant
+    /// re-slam, but we also don't want minutes of silence. Caps out rather
+    /// than growing forever.
+    private func backoffSeconds(forAttempt attempt: Int) -> Int {
+        min(3 * attempt, 30)
+    }
 
     /// How long a warning line keeps the menu bar icon in the "struggling"
     /// state after it was last seen. Long enough to notice, short enough
@@ -47,6 +71,10 @@ final class AppModel: ObservableObject {
     deinit {
         refreshTimer?.invalidate()
         statusTimer?.invalidate()
+        for timer in mountTickers.values { timer.invalidate() }
+        for timer in retryWaitTimers.values { timer.invalidate() }
+        for monitor in throughputMonitors.values { monitor.stop() }
+        for process in activeMountProcesses.values where process.isRunning { process.terminate() }
     }
 
     func refresh() {
@@ -120,42 +148,185 @@ final class AppModel: ObservableObject {
                 let present = Set(self.disks.flatMap { $0.partitions.map(\.id) })
                 for key in self.mountStates.keys where !present.contains(key) {
                     self.mountStates.removeValue(forKey: key)
-                    self.mountTimers[key]?.invalidate()
-                    self.mountTimers.removeValue(forKey: key)
+                    self.mountProgress.removeValue(forKey: key)
+                    self.autoRetryEnabled.removeValue(forKey: key)
+                    self.retryCounts.removeValue(forKey: key)
+                    self.mountGeneration.removeValue(forKey: key)
+                    self.mountTickers[key]?.invalidate()
+                    self.mountTickers.removeValue(forKey: key)
+                    self.retryWaitTimers[key]?.invalidate()
+                    self.retryWaitTimers.removeValue(forKey: key)
+                    self.throughputMonitors[key]?.stop()
+                    self.throughputMonitors.removeValue(forKey: key)
+                    self.activeMountProcesses[key]?.terminate()
+                    self.activeMountProcesses.removeValue(forKey: key)
                 }
                 self.recomputeStatus()
             }
         }
     }
 
-    func tryMount(_ partition: PartitionDevice) {
+    /// Starts (or restarts) a read-only mount attempt for a partition, with
+    /// auto-retry on by default: "auto try and mount regardless what" means
+    /// a failure, a timeout, or the drive disconnecting mid-attempt all lead
+    /// to another attempt after a short rest, not a dead end that waits for
+    /// another click. `resetRetries` is false when this is called internally
+    /// by the retry loop itself, so the attempt counter keeps climbing
+    /// instead of resetting to 1 every time.
+    func tryMount(_ partition: PartitionDevice, resetRetries: Bool = true) {
+        let id = partition.id
         let node = partition.node
-        mountStates[partition.id] = .trying(secondsLeft: 30)
 
-        var remaining = 30
-        mountTimers[partition.id]?.invalidate()
-        let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
+        if resetRetries {
+            retryCounts[id] = 0
+            autoRetryEnabled[id] = true
+        }
+        retryWaitTimers[id]?.invalidate()
+        retryWaitTimers[id] = nil
+
+        let attempt = (retryCounts[id] ?? 0) + 1
+        retryCounts[id] = attempt
+        let generation = (mountGeneration[id] ?? 0) + 1
+        mountGeneration[id] = generation
+
+        mountStates[id] = .trying
+        mountProgress[id] = MountProgress(attempt: attempt, secondsElapsed: 0, throughputMBps: nil,
+                                           phase: "Starting mount attempt…")
+        recomputeStatus()
+
+        startThroughputMonitor(for: id, wholeDisk: node.replacingOccurrences(of: "/dev/", with: "").wholeDiskName, generation: generation)
+
+        mountTickers[id]?.invalidate()
+        mountTickers[id] = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
+                guard let self, self.mountGeneration[id] == generation else { return }
+
+                if !DiskService.nodeExists(node) {
+                    self.finishAttempt(.disconnected, partitionId: id, generation: generation)
+                    return
+                }
+
+                var progress = self.mountProgress[id] ?? MountProgress(attempt: attempt)
+                progress.secondsElapsed += 1
+                if progress.secondsElapsed >= 3 {
+                    progress.phase = progress.throughputMBps != nil
+                        ? MountProgress.indexingPhase
+                        : "Still connecting…"
+                }
+                self.mountProgress[id] = progress
+            }
+        }
+
+        let process = DiskService.mountReadOnly(node: node) { [weak self] state in
+            DispatchQueue.main.async {
                 guard let self else { return }
-                remaining -= 1
-                if case .trying = self.mountStates[partition.id] ?? .idle, remaining > 0 {
-                    self.mountStates[partition.id] = .trying(secondsLeft: remaining)
+                self.finishAttempt(state, partitionId: id, generation: generation)
+            }
+        }
+        activeMountProcesses[id] = process
+    }
+
+    /// Turns off auto-retry for a partition and, if an attempt is currently
+    /// in flight or waiting out a backoff pause, stops that too. This is the
+    /// user's "stop retrying" control - auto-retry is generous by default,
+    /// but never a trap with no way out.
+    func stopRetrying(_ partitionId: String) {
+        autoRetryEnabled[partitionId] = false
+        retryWaitTimers[partitionId]?.invalidate()
+        retryWaitTimers[partitionId] = nil
+
+        if case .retryWaiting = mountStates[partitionId] ?? .idle {
+            mountStates[partitionId] = .idle
+            mountProgress.removeValue(forKey: partitionId)
+        }
+
+        activeMountProcesses[partitionId]?.terminate()
+        activeMountProcesses.removeValue(forKey: partitionId)
+        recomputeStatus()
+    }
+
+    /// Common landing point for every attempt outcome (success, real
+    /// failure, timeout, or disconnect), whether it came from the diskutil
+    /// completion handler or from this app's own faster disconnect watchdog.
+    /// Guards on `generation` so a stale result from a superseded attempt
+    /// can never overwrite newer state.
+    private func finishAttempt(_ state: MountAttemptState, partitionId: String, generation: Int) {
+        guard mountGeneration[partitionId] == generation else { return }
+
+        mountTickers[partitionId]?.invalidate()
+        mountTickers[partitionId] = nil
+        stopThroughputMonitor(for: partitionId)
+        activeMountProcesses.removeValue(forKey: partitionId)
+
+        mountStates[partitionId] = state
+        recomputeStatus()
+
+        switch state {
+        case .success, .idle:
+            mountProgress.removeValue(forKey: partitionId)
+            retryCounts[partitionId] = 0
+        case .timedOut, .disconnected, .failed:
+            if autoRetryEnabled[partitionId] == true {
+                scheduleRetry(partitionId: partitionId, generation: generation)
+            } else {
+                mountProgress.removeValue(forKey: partitionId)
+            }
+        case .trying, .retryWaiting:
+            break // not a terminal state; shouldn't reach here
+        }
+    }
+
+    private func scheduleRetry(partitionId: String, generation: Int) {
+        let attempt = retryCounts[partitionId] ?? 1
+        var secondsLeft = backoffSeconds(forAttempt: attempt)
+        mountStates[partitionId] = .retryWaiting(resumesIn: secondsLeft)
+        recomputeStatus()
+
+        retryWaitTimers[partitionId]?.invalidate()
+        retryWaitTimers[partitionId] = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            Task { @MainActor in
+                guard let self, self.mountGeneration[partitionId] == generation,
+                      self.autoRetryEnabled[partitionId] == true else {
+                    timer.invalidate()
+                    return
+                }
+                secondsLeft -= 1
+                if secondsLeft <= 0 {
+                    timer.invalidate()
+                    self.retryWaitTimers[partitionId] = nil
+                    // Look up the current partition by id - if the drive is
+                    // truly gone (not just resting), it won't be found, and
+                    // we stop rather than retry into thin air.
+                    guard let partition = self.disks.flatMap(\.partitions).first(where: { $0.id == partitionId }) else {
+                        self.mountStates[partitionId] = .disconnected
+                        self.recomputeStatus()
+                        return
+                    }
+                    self.tryMount(partition, resetRetries: false)
                 } else {
-                    t.invalidate()
+                    self.mountStates[partitionId] = .retryWaiting(resumesIn: secondsLeft)
                 }
             }
         }
-        mountTimers[partition.id] = timer
+    }
 
-        DiskService.mountReadOnly(node: node) { [weak self] state in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.mountTimers[partition.id]?.invalidate()
-                self.mountTimers[partition.id] = nil
-                self.mountStates[partition.id] = state
-                self.recomputeStatus()
-            }
+    private func startThroughputMonitor(for partitionId: String, wholeDisk: String, generation: Int) {
+        stopThroughputMonitor(for: partitionId)
+        let monitor = LineStreamer()
+        throughputMonitors[partitionId] = monitor
+        monitor.start("/usr/sbin/iostat", ["-w", "1", wholeDisk]) { [weak self] line in
+            guard let self, self.mountGeneration[partitionId] == generation,
+                  let mbps = DiskService.parseIostatMBps(line) else { return }
+            var progress = self.mountProgress[partitionId] ?? MountProgress()
+            progress.throughputMBps = mbps
+            progress.phase = MountProgress.indexingPhase
+            self.mountProgress[partitionId] = progress
         }
+    }
+
+    private func stopThroughputMonitor(for partitionId: String) {
+        throughputMonitors[partitionId]?.stop()
+        throughputMonitors.removeValue(forKey: partitionId)
     }
 
     func startLogStream() {
@@ -189,7 +360,7 @@ final class AppModel: ObservableObject {
         let recentWarning = lastWarningAt.map { Date().timeIntervalSince($0) < warningDecay } ?? false
         let mountTrouble = mountStates.values.contains { state in
             switch state {
-            case .timedOut, .disconnected, .failed: return true
+            case .timedOut, .disconnected, .failed, .retryWaiting: return true
             default: return false
             }
         }

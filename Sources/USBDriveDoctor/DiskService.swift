@@ -114,12 +114,23 @@ enum DiskService {
     /// any write/erase/repair option. Runs on a timeout so a hung diskutil
     /// call surfaces as "timed out", not a frozen UI.
     ///
+    /// The timeout defaults to a full hour, not 30 seconds: verified by hand
+    /// tonight against a real struggling drive, a legitimate read-only mount
+    /// of a large volume can take tens of minutes (walking the whole
+    /// directory tree) while behaving perfectly healthily the entire time.
+    /// A short timeout would misreport that as "timed out" and trigger a
+    /// pointless retry storm. `AppModel` layers its own much-faster
+    /// disconnect watchdog on top of this (polling `nodeExists`), so a real
+    /// drop is still caught quickly - this timeout is a last-resort ceiling,
+    /// not the primary signal.
+    ///
     /// SAFETY INVARIANT: this is one of exactly two diskutil calls this whole
     /// app is allowed to make (the other is `diskutil info`, which is
     /// read-only by nature). Every invocation of `diskutil mount` in this
     /// codebase MUST include "readOnly". Never add erase, format, repair, or
     /// First Aid anywhere - see README.md's "Permanent safety invariant".
-    static func mountReadOnly(node: String, timeout: TimeInterval = 30, completion: @escaping (MountAttemptState) -> Void) {
+    @discardableResult
+    static func mountReadOnly(node: String, timeout: TimeInterval = 3600, completion: @escaping (MountAttemptState) -> Void) -> Process? {
         ProcessRunner.run("/usr/sbin/diskutil", ["mount", "readOnly", node], timeout: timeout) { output in
             if output.timedOut {
                 completion(nodeExists(node) ? .timedOut : .disconnected)
@@ -139,5 +150,15 @@ enum DiskService {
     /// off the bus mid-attempt" apart from "diskutil returned a real error".
     static func nodeExists(_ node: String) -> Bool {
         FileManager.default.fileExists(atPath: node)
+    }
+
+    /// Parses one line of `iostat -w 1 <disk>` output, returning the MB/s
+    /// column when the line is a data row (not a header or the disk-name
+    /// banner iostat repeats periodically). iostat's columns are
+    /// `KB/t  tps  MB/s  us  sy  id  1m  5m  15m` - MB/s is index 2.
+    static func parseIostatMBps(_ line: String) -> Double? {
+        let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard fields.count >= 3, Double(fields[0]) != nil, let mbps = Double(fields[2]) else { return nil }
+        return mbps
     }
 }
