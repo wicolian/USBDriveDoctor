@@ -49,6 +49,7 @@ struct DiskDevice: Identifiable, Equatable {
     var usbSpeed: USBSpeed = .unknown
     var smartStatus: String = "-"
     var content: String = "-"
+    var isExternal: Bool = true
     var partitions: [PartitionDevice] = []
 }
 

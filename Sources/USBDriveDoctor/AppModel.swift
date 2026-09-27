@@ -73,6 +73,7 @@ final class AppModel: ObservableObject {
                         device.protocolName = info["Protocol"] ?? "-"
                         device.smartStatus = info["SMART Status"] ?? "-"
                         device.content = info["Content (IOContent)"] ?? info["Content"] ?? "-"
+                        device.isExternal = (info["Device Location"] == "External")
                     }
                     device.usbSpeed = USBSpeed.from(linkSpeedHz: speeds[device.mediaName])
 
@@ -106,7 +107,12 @@ final class AppModel: ObservableObject {
             }
 
             group.notify(queue: .main) {
-                self.disks = built.sorted { $0.id < $1.id }
+                // Internal volumes (the boot APFS container, its snapshots,
+                // Preboot/Recovery/VM) are real "disks" by the same /dev
+                // scan, but they are not what this app is for and only add
+                // noise ahead of the drive someone actually came here to
+                // check. Show external media only.
+                self.disks = built.filter(\.isExternal).sorted { $0.id < $1.id }
                 self.isRefreshing = false
                 // Drop mount-state and timer bookkeeping for partitions that
                 // are no longer present, so a disconnected drive doesn't
